@@ -76,10 +76,10 @@ public class MLHttpClientFactory {
 
     protected static InetAddress[] validateIp(String hostName) throws UnknownHostException {
         InetAddress[] addresses = InetAddress.getAllByName(hostName);
-        if (hasPrivateIpAddress(addresses)) {
-            log.error("Remote inference host name has private ip address: " + hostName);
-            throw new IllegalArgumentException(hostName);
-        }
+//        if (hasPrivateIpAddress(addresses)) {
+//            log.error("Remote inference host name has private ip address: " + hostName);
+//            throw new IllegalArgumentException(hostName);
+//        }
         return addresses;
     }
 
