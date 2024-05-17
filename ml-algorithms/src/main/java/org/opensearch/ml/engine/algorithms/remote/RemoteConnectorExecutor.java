@@ -8,18 +8,24 @@ package org.opensearch.ml.engine.algorithms.remote;
 import static org.opensearch.ml.engine.algorithms.remote.ConnectorUtils.escapeRemoteInferenceInputData;
 import static org.opensearch.ml.engine.algorithms.remote.ConnectorUtils.processInput;
 
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.atomic.AtomicReference;
 
+import org.apache.logging.log4j.Logger;
+import org.opensearch.ExceptionsHelper;
 import org.opensearch.OpenSearchStatusException;
+import org.opensearch.action.bulk.BackoffPolicy;
+import org.opensearch.action.support.GroupedActionListener;
+import org.opensearch.action.support.RetryableAction;
 import org.opensearch.client.Client;
 import org.opensearch.cluster.service.ClusterService;
 import org.opensearch.common.collect.Tuple;
+import org.opensearch.common.unit.TimeValue;
 import org.opensearch.common.util.TokenBucket;
 import org.opensearch.commons.ConfigConstants;
 import org.opensearch.commons.authuser.User;
@@ -41,39 +47,47 @@ import org.opensearch.ml.common.transport.MLTaskResponse;
 import org.opensearch.script.ScriptService;
 
 public interface RemoteConnectorExecutor {
+    String EXECUTOR = "opensearch_ml_predict_remote";
 
     default void executePredict(MLInput mlInput, ActionListener<MLTaskResponse> actionListener) {
-        ActionListener<List<ModelTensors>> tensorActionListener = ActionListener.wrap(r -> {
-            actionListener.onResponse(new MLTaskResponse(new ModelTensorOutput(r)));
+        ActionListener<Collection<Tuple<Integer, ModelTensors>>> tensorActionListener = ActionListener.wrap(r -> {
+            // Only all sub-requests success will call logics here
+            ModelTensors[] modelTensors = new ModelTensors[r.size()];
+            r.forEach(sequenceNoAndModelTensor ->  modelTensors[sequenceNoAndModelTensor.v1()] = sequenceNoAndModelTensor.v2());
+            actionListener.onResponse(new MLTaskResponse(new ModelTensorOutput(Arrays.asList(modelTensors))));
         }, actionListener::onFailure);
+
         try {
-            Map<Integer, ModelTensors> modelTensors = new ConcurrentHashMap<>();
-            AtomicReference<Exception> exceptionHolder = new AtomicReference<>();
             if (mlInput.getInputDataset() instanceof TextDocsInputDataSet) {
                 TextDocsInputDataSet textDocsInputDataSet = (TextDocsInputDataSet) mlInput.getInputDataset();
                 Tuple<Integer, Integer> calculatedChunkSize = calculateChunkSize(textDocsInputDataSet);
-                CountDownLatch countDownLatch = new CountDownLatch(calculatedChunkSize.v1());
+                GroupedActionListener<Tuple<Integer, ModelTensors>> groupedActionListener = new GroupedActionListener<>(
+                        tensorActionListener,
+                        calculatedChunkSize.v1()
+                );
                 int sequence = 0;
                 for (int processedDocs = 0; processedDocs < textDocsInputDataSet.getDocs().size(); processedDocs += calculatedChunkSize
                     .v2()) {
-                    List<String> textDocs = textDocsInputDataSet.getDocs().subList(processedDocs, textDocsInputDataSet.getDocs().size());
+                    List<String> textDocs = textDocsInputDataSet.getDocs().subList(processedDocs, processedDocs + calculatedChunkSize
+                            .v2());
                     preparePayloadAndInvokeRemoteModel(
                         MLInput
                             .builder()
                             .algorithm(FunctionName.TEXT_EMBEDDING)
                             .inputDataset(TextDocsInputDataSet.builder().docs(textDocs).build())
                             .build(),
-                        modelTensors,
-                        new ExecutionContext(sequence++, countDownLatch, exceptionHolder),
-                        tensorActionListener
+                        new ExecutionContext(sequence++),
+                        groupedActionListener
                     );
                 }
             } else {
                 preparePayloadAndInvokeRemoteModel(
                     mlInput,
-                    modelTensors,
-                    new ExecutionContext(0, new CountDownLatch(1), exceptionHolder),
-                    tensorActionListener
+                    new ExecutionContext(0),
+                    new GroupedActionListener<>(
+                        tensorActionListener,
+                        1
+                    )
                 );
             }
         } catch (Exception e) {
@@ -130,6 +144,8 @@ public interface RemoteConnectorExecutor {
 
     Client getClient();
 
+    Logger getLogger();
+
     default void setClient(Client client) {}
 
     default void setXContentRegistry(NamedXContentRegistry xContentRegistry) {}
@@ -144,9 +160,8 @@ public interface RemoteConnectorExecutor {
 
     default void preparePayloadAndInvokeRemoteModel(
         MLInput mlInput,
-        Map<Integer, ModelTensors> tensorOutputs,
-        ExecutionContext countDownLatch,
-        ActionListener<List<ModelTensors>> actionListener
+        ExecutionContext executionContext,
+        ActionListener<Tuple<Integer, ModelTensors>> actionListener
     ) {
         Connector connector = getConnector();
 
@@ -188,16 +203,50 @@ public interface RemoteConnectorExecutor {
             if (getMlGuard() != null && !getMlGuard().validate(payload, MLGuard.Type.INPUT)) {
                 throw new IllegalArgumentException("guardrails triggered for user input");
             }
-            invokeRemoteModel(mlInput, parameters, payload, tensorOutputs, countDownLatch, actionListener);
+            invokeRemoteModelWithRetry(mlInput, parameters, payload, executionContext, actionListener);
         }
     }
+
+    default void invokeRemoteModelWithRetry(
+        MLInput mlInput,
+        Map<String, String> parameters,
+        String payload,
+        ExecutionContext executionContext,
+        ActionListener<Tuple<Integer, ModelTensors>> actionListener
+    ) {
+        final RetryableAction<Tuple<Integer, ModelTensors>> invokeRemoteModelAction = new RetryableAction<>(
+                getLogger(),
+                getClient().threadPool(),
+                TimeValue.timeValueMillis(100),
+                TimeValue.timeValueSeconds(30),
+                actionListener,
+                BackoffPolicy.constantBackoff(TimeValue.timeValueMillis(100), Integer.MAX_VALUE),
+                EXECUTOR
+        ) {
+            Integer retryTime = 0;
+
+            @Override
+            public void tryAction(ActionListener<Tuple<Integer, ModelTensors>> listener) {
+                // the listener here is RetryingListener
+                // If the request success, or can not retry, will call delegate listener
+                invokeRemoteModel(mlInput, parameters, payload, executionContext, listener);
+            }
+
+            @Override
+            public boolean shouldRetry(Exception e) {
+                getLogger().debug(String.format(Locale.ROOT, "The %d-th retry for invoke remote model", retryTime++));
+                final Throwable cause = ExceptionsHelper.unwrapCause(e);
+                return cause instanceof OpenSearchStatusException && cause.getMessage().startsWith("ThrottlingException");
+            }
+        };
+        invokeRemoteModelAction.run();
+    };
 
     void invokeRemoteModel(
         MLInput mlInput,
         Map<String, String> parameters,
         String payload,
-        Map<Integer, ModelTensors> tensorOutputs,
-        ExecutionContext countDownLatch,
-        ActionListener<List<ModelTensors>> actionListener
+        ExecutionContext executionContext,
+        ActionListener<Tuple<Integer, ModelTensors>> actionListener
     );
 }
