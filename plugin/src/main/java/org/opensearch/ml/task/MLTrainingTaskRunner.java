@@ -5,9 +5,13 @@
 
 package org.opensearch.ml.task;
 
+import static org.opensearch.common.xcontent.XContentType.JSON;
+import static org.opensearch.core.xcontent.ToXContent.EMPTY_PARAMS;
 import static org.opensearch.ml.common.CommonValue.ML_MODEL_INDEX;
+import static org.opensearch.ml.engine.utils.FileUtils.deleteFileQuietly;
 import static org.opensearch.ml.plugin.MachineLearningPlugin.TRAIN_THREAD_POOL;
 
+import java.io.IOException;
 import java.time.Instant;
 import java.util.UUID;
 
@@ -25,6 +29,7 @@ import org.opensearch.core.xcontent.ToXContent;
 import org.opensearch.core.xcontent.XContentBuilder;
 import org.opensearch.ml.breaker.MLCircuitBreakerService;
 import org.opensearch.ml.cluster.DiscoveryNodeHelper;
+import org.opensearch.ml.common.FunctionName;
 import org.opensearch.ml.common.MLModel;
 import org.opensearch.ml.common.MLTask;
 import org.opensearch.ml.common.MLTaskState;
@@ -32,6 +37,8 @@ import org.opensearch.ml.common.MLTaskType;
 import org.opensearch.ml.common.dataset.MLInputDataType;
 import org.opensearch.ml.common.dataset.MLInputDataset;
 import org.opensearch.ml.common.input.MLInput;
+import org.opensearch.ml.common.model.MLModelFormat;
+import org.opensearch.ml.common.model.MLModelState;
 import org.opensearch.ml.common.output.MLTrainingOutput;
 import org.opensearch.ml.common.transport.MLTaskResponse;
 import org.opensearch.ml.common.transport.training.MLTrainingTaskAction;
@@ -197,6 +204,10 @@ public class MLTrainingTaskRunner extends MLTaskRunner<MLTrainingTaskRequest, ML
                 }
                 // TODO: put the user into model for backend role based access control.
                 try (ThreadContext.StoredContext context = client.threadPool().getThreadContext().stashContext()) {
+                    if(mlModel.getAlgorithm()== FunctionName.SPARSE_TOKENIZE){
+                        saveChunkedModelToIndex(mlModel, mlTask, listener);
+                        return;
+                    }
                     ActionListener<IndexResponse> indexResponseListener = ActionListener.wrap(r -> {
                         log.info("Model saved into index, result:{}, model id: {}", r.getResult(), r.getId());
                         String returnedTaskId = mlTask.isAsync() ? mlTask.getTaskId() : null;
@@ -220,6 +231,44 @@ public class MLTrainingTaskRunner extends MLTaskRunner<MLTrainingTaskRequest, ML
             // todo need to specify what exception
             log.error("Failed to train " + mlInput.getAlgorithm(), e);
             listener.onFailure(e);
+        }
+    }
+
+    private void saveChunkedModelToIndex(MLModel mlModel, MLTask mlTask, ActionListener<MLTaskResponse> listener){
+        IndexRequest indexMetaRequest = new IndexRequest(ML_MODEL_INDEX);
+        try {
+            MLModel mlModelMeta = MLModel
+                    .builder()
+                    .name(mlModel.getName())
+                    .modelGroupId(mlModel.getModelGroupId())
+                    .algorithm(mlModel.getAlgorithm())
+                    .version(mlModel.getVersion())
+                    .modelFormat(MLModelFormat.TORCH_SCRIPT)
+                    .modelState(MLModelState.REGISTERING)
+                    .totalChunks(mlModel.getTotalChunks())
+                    .build();
+            indexMetaRequest.source(mlModelMeta.toXContent(XContentBuilder.builder(XContentType.JSON.xContent()), ToXContent.EMPTY_PARAMS));
+            indexMetaRequest.setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);
+            ActionListener<IndexResponse> metaResListener = ActionListener.wrap(modelMetaRes -> {
+                String modelId = modelMetaRes.getId();
+                IndexRequest indexRequest = new IndexRequest(ML_MODEL_INDEX);
+                mlModel.setModelId(modelId);
+                String chunkId = modelId + "_0";
+                indexRequest.id(chunkId);
+                indexRequest.source(mlModel.toXContent(XContentBuilder.builder(JSON.xContent()), EMPTY_PARAMS));
+                indexRequest.setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);
+                client.index(indexRequest, ActionListener.wrap(r -> {
+                    String returnedTaskId = mlTask.isAsync() ? mlTask.getTaskId() : null;
+                    MLTrainingOutput output = new MLTrainingOutput(r.getId(), returnedTaskId, MLTaskState.COMPLETED.name());
+                    listener.onResponse(MLTaskResponse.builder().output(output).build());
+                },  listener::onFailure));
+            }, e -> {
+                log.error("Failed to index model meta doc", e);
+                listener.onFailure(e);
+            });
+            client.index(indexMetaRequest, metaResListener);
+        } catch (IOException e) {
+            throw new RuntimeException(e);
         }
     }
 }

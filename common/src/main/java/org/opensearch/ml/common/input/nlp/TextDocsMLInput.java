@@ -11,6 +11,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Objects;
 
 import org.opensearch.core.common.io.stream.StreamInput;
 import org.opensearch.core.common.io.stream.StreamOutput;
@@ -21,6 +22,7 @@ import org.opensearch.ml.common.dataset.MLInputDataset;
 import org.opensearch.ml.common.dataset.TextDocsInputDataSet;
 import org.opensearch.ml.common.input.MLInput;
 import org.opensearch.ml.common.input.parameter.MLAlgoParams;
+import org.opensearch.ml.common.input.parameter.sparsetokenize.SparseTokenizeParams;
 import org.opensearch.ml.common.output.model.ModelResultFilter;
 
 /**
@@ -148,12 +150,24 @@ public class TextDocsMLInput extends MLInput {
                 .targetResponsePositions(targetResponsePositions)
                 .build();
 
+        this.parameters = mlParameters;
+        if (canOmitInputDataset()) {
+            inputDataset = new TextDocsInputDataSet(List.of("test"), filter);
+            return;
+        }
+
         if (docs.size() == 0) {
-            throw new IllegalArgumentException("Empty text docs");
+                throw new IllegalArgumentException("Empty text docs");
         }
         inputDataset = new TextDocsInputDataSet(docs, filter);
-
-        this.parameters = mlParameters;
     }
 
+    public boolean canOmitInputDataset() {
+        if (this.algorithm == FunctionName.SPARSE_TOKENIZE
+                && Objects.nonNull(parameters)
+                && ((SparseTokenizeParams) parameters).hasContent()){
+            return true;
+        }
+        return false;
+    }
 }
